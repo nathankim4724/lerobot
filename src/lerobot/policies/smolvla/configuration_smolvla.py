@@ -81,6 +81,11 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
+    # Frames at the end of each episode never used as a training start (read by lerobot_train.py's
+    # EpisodeAwareSampler, and applied to the held-out eval set too). 0 = use every frame, as before.
+    # Set it to chunk_size - 1 to train only on starts whose whole action chunk is inside the episode.
+    drop_n_last_frames: int = 0
+
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
@@ -115,6 +120,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if self.drop_n_last_frames < 0:
+            raise ValueError(f"drop_n_last_frames must be >= 0, got {self.drop_n_last_frames}")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

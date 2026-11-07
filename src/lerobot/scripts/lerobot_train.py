@@ -378,7 +378,26 @@ def make_dataloaders(
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+        drop_n_last_frames = getattr(active_cfg, "drop_n_last_frames", 0)
+        if drop_n_last_frames > 0:
+            # Score the same frames training samples from: skip each episode's last frames, as the
+            # train sampler does. Otherwise the eval loss is weighted toward late, truncated chunks.
+            if cfg.max_eval_samples > 0:
+                raise ValueError("max_eval_samples and drop_n_last_frames can't be combined; set one to 0.")
+            eval_frames = EpisodeAwareSampler(
+                eval_dataset.meta.episodes["dataset_from_index"],
+                eval_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=eval_dataset.episodes,
+                drop_n_last_frames=drop_n_last_frames,
+                shuffle=False,
+                absolute_to_relative_idx=eval_dataset.absolute_to_relative_idx,
+            ).indices
+            logging.info(
+                f"Eval set: {len(eval_frames)} of {len(eval_dataset)} frames "
+                f"(drop_n_last_frames={drop_n_last_frames})"
+            )
+            eval_ds = torch.utils.data.Subset(eval_dataset, eval_frames)
+        elif cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
             task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
