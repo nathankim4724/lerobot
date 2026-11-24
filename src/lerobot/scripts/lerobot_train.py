@@ -843,14 +843,20 @@ def train(cfg: TrainPipelineConfig):
             policy.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
+            eval_extra_sums: dict[str, float] = {}
             with torch.no_grad(), accelerator.autocast():
                 for eval_batch in eval_dataloader:
                     eval_batch = _preprocess_dataset_batch(
                         eval_batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor
                     )
-                    loss, _ = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
+                    loss, eval_out = policy(eval_batch)  # __call__, so FSDP2 forward hooks run
                     eval_loss_sum += loss.item()
                     n_eval_batches += 1
+                    # NCA sequence pretraining: also average the policy's own held-out scalars
+                    # (token accuracy, loss per frame). Other policies return none of these keys.
+                    for key, value in (eval_out or {}).items():
+                        if key.startswith(("seq_", "ntp_")) and isinstance(value, int | float):
+                            eval_extra_sums[key] = eval_extra_sums.get(key, 0.0) + float(value)
             eval_loss = eval_loss_sum / max(n_eval_batches, 1)
             eval_loss = torch.tensor(eval_loss, device=device)
             eval_loss = accelerator.reduce(eval_loss, reduction="mean").item()
@@ -858,8 +864,13 @@ def train(cfg: TrainPipelineConfig):
 
             if is_main_process():
                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
+                eval_extra = {k: v / max(n_eval_batches, 1) for k, v in eval_extra_sums.items()}
+                if eval_extra:
+                    logging.info(
+                        f"step {step}: " + " ".join(f"eval_{k}={v:.4f}" for k, v in eval_extra.items())
+                    )
                 if wandb_logger:
-                    wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+                    wandb_logger.log_dict({"eval_loss": eval_loss, **eval_extra}, step=step, mode="eval")
 
         if cfg.save_checkpoint and is_saving_step:
             # Collective: every rank participates (gathers / DCP shard writes); rank-0-only file

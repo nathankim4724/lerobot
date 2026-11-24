@@ -59,6 +59,7 @@ from typing import TypedDict, Unpack
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
 from lerobot.utils.import_utils import require_package
@@ -75,7 +76,7 @@ from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import (
     populate_queues,
 )
-from .configuration_smolvla import SmolVLAConfig
+from .configuration_smolvla import OBS_SEQ, SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
 
@@ -287,6 +288,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 - "mean": Return scalar mean loss (default, backward compatible)
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
+        if self.config.stage1_input == "seq":
+            return self._forward_seq(batch, noise=noise, time=time, reduction=reduction)
+
         if self.config.adapt_to_pi_aloha:
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
@@ -330,6 +334,34 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 loss = losses.sum() / num_valid
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def _forward_seq(
+        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean", mae_mask=None
+    ) -> tuple[Tensor, dict]:
+        """Training loss when the suffix is the NCA sequence in batch["observation.seq"] (stage1_input == "seq").
+
+        The prefix (image, prompt, state) is built as usual; the action in the batch is ignored. The loss is the
+        mean over the tokens that count: all of them for flow matching and next-token prediction, the hidden
+        ones for MAE.
+        """
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        seq = batch[OBS_SEQ]
+        seq = seq.reshape(seq.shape[0], -1)  # drops the length-1 time axis the dataset adds
+
+        losses, weights, info = self.model.forward_seq(
+            images, img_masks, lang_tokens, lang_masks, state, seq, noise=noise, time=time, mae_mask=mae_mask
+        )
+        loss_dict = dict(info)
+        if reduction == "none":
+            per_sample_loss = (losses * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+            loss_dict["loss"] = per_sample_loss.mean().item()
+            return per_sample_loss, loss_dict
+        loss = (losses * weights).sum() / weights.sum().clamp_min(1)
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -517,6 +549,23 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+
+        if self.config.stage1_input == "seq":
+            # Stage 1-only modules (NCA sequences). Created after everything else and only in this mode, so the
+            # default model's parameters and their random init are unchanged. All are dropped before fine-tuning.
+            hidden = self.vlm_with_expert.expert_hidden_size
+            # Which patch (or 2x2 group) of the frame a token is; frame order comes from the position ids.
+            self.seq_pos_embed = nn.Embedding(self.config.seq_tokens_per_frame, hidden)
+            nn.init.normal_(self.seq_pos_embed.weight, std=0.02)
+            if self.config.seq_token == "bin16":
+                is_ntp = self.config.stage1_objective == "ntp"
+                # NTP has one more ID: the start token fed at position 0.
+                self.seq_embed = nn.Embedding(self.config.seq_vocab + int(is_ntp), hidden)
+                nn.init.normal_(self.seq_embed.weight, std=0.02)
+                self.seq_head = nn.Linear(hidden, self.config.seq_vocab)
+                if not is_ntp:
+                    self.seq_mask_embed = nn.Parameter(torch.zeros(hidden))
+                    nn.init.normal_(self.seq_mask_embed, std=0.02)
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -716,12 +765,161 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
         )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -suffix_embs.shape[1] :]  # the suffix (= chunk_size actions)
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
+
+    # ---------------------------------------------------------------------------------------------------------
+    # NCA pre-pretraining on whole-grid sequences (config.stage1_input == "seq")
+    # ---------------------------------------------------------------------------------------------------------
+    def seq_to_tokens(self, seq: Tensor) -> Tensor:
+        """Raw RGB sequence [B, frames * 64 * 3] (frame, patch, channel order) -> normalized tokens [B, L, d].
+
+        rgb3: one token per 4x4 patch, d = 3, L = frames * 64.
+        rgb12: 2x2 neighbouring patches of the 8x8 patch grid as one token, d = 12, L = frames * 16. Group (R, C)
+        is token 4R + C of its frame and holds [top-left, top-right, bottom-left, bottom-right patch] x [R, G, B].
+        """
+        cfg = self.config
+        bsize = seq.shape[0]
+        x = seq.reshape(bsize, cfg.seq_frames, 64, 3).to(torch.float32)
+        mean = torch.tensor(cfg.seq_norm_mean, dtype=x.dtype, device=x.device)
+        std = torch.tensor(cfg.seq_norm_std, dtype=x.dtype, device=x.device)
+        x = (x - mean) / std
+        if cfg.seq_token == "rgb3":
+            return x.reshape(bsize, cfg.seq_frames * 64, 3)
+        x = x.reshape(bsize, cfg.seq_frames, 4, 2, 4, 2, 3)  # [frame, R, dr, C, dc, channel]
+        x = x.permute(0, 1, 2, 4, 3, 5, 6)  # [frame, R, C, dr, dc, channel]
+        return x.reshape(bsize, cfg.seq_frames * 16, 12)
+
+    def sample_mae_mask(self, bsize: int, device) -> Tensor:
+        """Which tokens to hide, [B, L] bool (True = hidden). Exactly round(ratio * n) of the n tokens / frames /
+        patch positions are hidden in each sample."""
+        cfg = self.config
+        frames, per_frame = cfg.seq_frames, cfg.seq_tokens_per_frame
+
+        def pick(n: int) -> Tensor:
+            k = round(cfg.mae_mask_ratio * n)
+            return torch.rand(bsize, n, device=device).argsort(dim=1).argsort(dim=1) < k
+
+        if cfg.mae_mask == "token":
+            return pick(frames * per_frame)
+        if cfg.mae_mask == "frame":
+            return pick(frames)[:, :, None].expand(bsize, frames, per_frame).reshape(bsize, -1)
+        return pick(per_frame)[:, None, :].expand(bsize, frames, per_frame).reshape(bsize, -1)  # tube
+
+    def _seq_cross_entropy(self, hidden: Tensor, targets: Tensor, chunk: int = 8192) -> tuple[Tensor, Tensor]:
+        """hidden [N, H], targets [N] -> (cross-entropy [N], correct [N] bool), through seq_head in float32.
+
+        The logits are N x vocab numbers (64 x 1,024 x 65,536 floats = 17 GB for one batch). While training, the
+        head and loss are therefore run a chunk of tokens at a time under gradient checkpointing: only one chunk's
+        logits exist at any moment, in the forward pass and again in the backward pass. Same values and gradients.
+        """
+
+        def head_ce(h: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
+            with torch.autocast(device_type=h.device.type, enabled=False):
+                logits = self.seq_head(h.to(self.seq_head.weight.dtype)).float()
+                return F.cross_entropy(logits, t, reduction="none"), logits.argmax(dim=-1) == t
+
+        use_checkpoint = torch.is_grad_enabled() and hidden.requires_grad
+        ce, correct = [], []
+        for i in range(0, hidden.shape[0], chunk):
+            h, t = hidden[i : i + chunk], targets[i : i + chunk]
+            c, ok = checkpoint(head_ce, h, t, use_reentrant=False) if use_checkpoint else head_ce(h, t)
+            ce.append(c)
+            correct.append(ok)
+        return torch.cat(ce), torch.cat(correct)
+
+    def forward_seq(
+        self, images, img_masks, lang_tokens, lang_masks, state, seq, noise=None, time=None, mae_mask=None
+    ) -> tuple[Tensor, Tensor, dict]:
+        """Loss on an NCA sequence used as the expert's suffix. The prefix is embedded exactly as in `forward`.
+
+        seq: [B, L] integer IDs (bin16) or [B, frames * 64 * 3] raw floats (rgb3 / rgb12).
+        Returns (losses [B, L], weights [B, L], info): one loss per token, the tokens that count (1 / 0), and
+        scalars to log.
+          flow: flow matching on the normalized tokens, causal suffix (as actions); squared error averaged over
+                the token's real dims only (not the padding up to max_action_dim).
+          ntp:  input = start token + tokens 0..L-2, causal; cross-entropy against tokens 0..L-1.
+          mae:  hidden tokens replaced by a learned embedding; the suffix attends to all of itself; cross-entropy
+                on the hidden tokens only.
+        """
+        cfg = self.config
+        bsize, length, per_frame = seq.shape[0], cfg.seq_len, cfg.seq_tokens_per_frame
+        objective = cfg.stage1_objective
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        device = prefix_embs.device
+        pos_emb = self.seq_pos_embed(torch.arange(length, device=device) % per_frame)[None]
+
+        if objective == "flow":
+            x = pad_vector(self.seq_to_tokens(seq), cfg.max_action_dim)
+            if noise is None:
+                noise = self.sample_noise(x.shape, x.device)
+            if time is None:
+                time = self.sample_time(bsize, x.device)
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * x
+            u_t = noise - x
+            suffix_embs, _, _ = self.embed_suffix(x_t, time)  # action_in_proj + time MLP, as for actions
+            suffix_embs = suffix_embs + pos_emb.to(suffix_embs.dtype)
+        else:
+            tokens = seq.reshape(bsize, length).long()
+            if objective == "ntp":
+                start = torch.full((bsize, 1), cfg.seq_vocab, dtype=torch.long, device=tokens.device)
+                suffix_embs = self.seq_embed(torch.cat([start, tokens[:, :-1]], dim=1))
+            else:
+                if mae_mask is None:
+                    mae_mask = self.sample_mae_mask(bsize, tokens.device)
+                suffix_embs = self.seq_embed(tokens)
+                suffix_embs = torch.where(
+                    mae_mask[:, :, None], self.seq_mask_embed.to(suffix_embs.dtype), suffix_embs
+                )
+            suffix_embs = suffix_embs + pos_emb
+
+        suffix_pad_masks = torch.ones(bsize, length, dtype=torch.bool, device=device)
+        # Causal: every token starts a new attention block (as actions do). MAE: one block, so the suffix
+        # attends to all of itself. Either way the prefix never attends to the suffix.
+        att = torch.ones(length, dtype=suffix_embs.dtype, device=device)
+        if objective == "mae":
+            att[1:] = 0
+        suffix_att_masks = att[None, :].expand(bsize, length)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+        )
+        suffix_out = suffix_out[:, -length:].to(dtype=torch.float32)
+
+        info = {}
+        if objective == "flow":
+            v_t = self.action_out_proj(suffix_out)
+            losses = F.mse_loss(u_t, v_t, reduction="none")[:, :, : cfg.seq_token_dim].mean(dim=-1)
+            weights = torch.ones_like(losses)
+        elif objective == "ntp":
+            ce, correct = self._seq_cross_entropy(suffix_out.reshape(bsize * length, -1), tokens.reshape(-1))
+            losses = ce.view(bsize, length)
+            weights = torch.ones_like(losses)
+            info["seq_acc"] = correct.float().mean().item()
+            per_frame_loss = losses.detach().view(bsize, cfg.seq_frames, per_frame).mean(dim=(0, 2))
+            for i, value in enumerate(per_frame_loss.tolist()):
+                info[f"ntp_loss_frame_{i}"] = value
+        else:
+            ce, correct = self._seq_cross_entropy(suffix_out[mae_mask], tokens[mae_mask])
+            losses = torch.zeros(bsize, length, dtype=ce.dtype, device=ce.device).masked_scatter(mae_mask, ce)
+            weights = mae_mask.to(losses.dtype)
+            info["seq_acc"] = correct.float().mean().item()
+        return losses, weights, info
 
     def sample_actions(
         self,

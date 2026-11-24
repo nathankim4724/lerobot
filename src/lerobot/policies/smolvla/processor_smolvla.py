@@ -27,7 +27,7 @@ from lerobot.processor import (
     make_policy_processor_pipelines,
 )
 
-from .configuration_smolvla import SmolVLAConfig
+from .configuration_smolvla import OBS_SEQ, SmolVLAConfig
 
 
 def make_smolvla_pre_post_processors(
@@ -61,6 +61,10 @@ def make_smolvla_pre_post_processors(
     """
 
     steps = make_default_policy_processor_steps(config, dataset_stats)
+    if config.stage1_input == "seq":
+        # The NCA sequence (integer IDs, or values the model normalizes per channel itself) must reach the policy
+        # untouched. lerobot types every "observation.*" vector as STATE, so name the keys to normalize instead.
+        steps.normalize.normalize_observation_keys = {k for k in config.input_features if k != OBS_SEQ}
 
     input_steps = [
         steps.rename_observations,  # To mimic the same processor as pretrained one

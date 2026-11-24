@@ -20,6 +20,9 @@ from lerobot.utils.constants import OBS_IMAGES
 
 from ..rtc.configuration_rtc import RTCConfig
 
+# Batch key of the whole-grid NCA sequence used when `stage1_input == "seq"` (NCA pre-pretraining only).
+OBS_SEQ = "observation.seq"
+
 
 @PreTrainedConfig.register_subclass("smolvla")
 @dataclass
@@ -86,6 +89,26 @@ class SmolVLAConfig(PreTrainedConfig):
     # Set it to chunk_size - 1 to train only on starts whose whole action chunk is inside the episode.
     drop_n_last_frames: int = 0
 
+    # --- NCA pre-pretraining on whole-grid sequences (Stage 1 only). Defaults = normal SmolVLA training. ---
+    # "chunk": the usual action chunk. "seq": the expert's suffix is the sequence in batch["observation.seq"]
+    # (seq_frames frames of tokens, in time order; tokens of a frame row by row) and actions are ignored.
+    stage1_input: str = "chunk"
+    # Loss on the sequence: "flow" (flow matching, continuous tokens), "mae" (masked tokens, cross-entropy,
+    # bidirectional attention inside the sequence) or "ntp" (next-token prediction, cross-entropy, causal).
+    stage1_objective: str = "flow"
+    # "bin16": integer IDs of 4x4 binary patches, 64 per frame (mae / ntp). "rgb3": 3 numbers per patch, 64 per
+    # frame. "rgb12": 2x2 neighbouring patches as one 12-number token, 16 per frame (both flow).
+    seq_token: str = "bin16"
+    seq_frames: int = 16
+    seq_vocab: int = 65536
+    # MAE: what is hidden. "token": random tokens; "frame": whole frames; "tube": the same patch positions in
+    # every frame. mae_mask_ratio of the tokens / frames / positions are hidden in each sample.
+    mae_mask: str = "token"
+    mae_mask_ratio: float = 0.75
+    # rgb3 / rgb12: per-channel (R, G, B) mean and std of the raw values, from the dataset's build record.
+    seq_norm_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    seq_norm_std: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
     load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
 
@@ -122,6 +145,29 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.drop_n_last_frames < 0:
             raise ValueError(f"drop_n_last_frames must be >= 0, got {self.drop_n_last_frames}")
+        if self.stage1_input not in ("chunk", "seq"):
+            raise ValueError(f"stage1_input must be 'chunk' or 'seq', got {self.stage1_input!r}")
+        if self.stage1_input == "seq":
+            if self.stage1_objective not in ("flow", "mae", "ntp"):
+                raise ValueError(
+                    f"stage1_objective must be 'flow', 'mae' or 'ntp', got {self.stage1_objective!r}"
+                )
+            if self.seq_token not in ("bin16", "rgb3", "rgb12"):
+                raise ValueError(f"seq_token must be 'bin16', 'rgb3' or 'rgb12', got {self.seq_token!r}")
+            if (self.seq_token == "bin16") != (self.stage1_objective in ("mae", "ntp")):
+                raise ValueError(
+                    "seq_token 'bin16' goes with stage1_objective 'mae' / 'ntp'; 'rgb3' / 'rgb12' with 'flow'"
+                )
+            if self.mae_mask not in ("token", "frame", "tube"):
+                raise ValueError(f"mae_mask must be 'token', 'frame' or 'tube', got {self.mae_mask!r}")
+            if not 0.0 < self.mae_mask_ratio < 1.0:
+                raise ValueError(f"mae_mask_ratio must be in (0, 1), got {self.mae_mask_ratio}")
+            if self.seq_frames < 1 or self.seq_vocab < 2:
+                raise ValueError("seq_frames must be >= 1 and seq_vocab >= 2")
+            if len(self.seq_norm_mean) != 3 or len(self.seq_norm_std) != 3 or min(self.seq_norm_std) <= 0:
+                raise ValueError("seq_norm_mean / seq_norm_std need 3 values each (R, G, B), std > 0")
+            if self.seq_token_dim > self.max_action_dim:
+                raise ValueError("seq tokens are wider than max_action_dim")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
@@ -152,6 +198,20 @@ class SmolVLAConfig(PreTrainedConfig):
             num_warmup_steps=self.scheduler_warmup_steps,
             num_decay_steps=self.scheduler_decay_steps,
         )
+
+    @property
+    def seq_tokens_per_frame(self) -> int:
+        """Tokens per frame of the 8x8-patch grid: 64 patches, or 16 groups of 2x2 patches."""
+        return 16 if self.seq_token == "rgb12" else 64
+
+    @property
+    def seq_len(self) -> int:
+        return self.seq_frames * self.seq_tokens_per_frame
+
+    @property
+    def seq_token_dim(self) -> int:
+        """Numbers per continuous token (rgb3 / rgb12); 1 for integer IDs."""
+        return {"bin16": 1, "rgb3": 3, "rgb12": 12}[self.seq_token]
 
     @property
     def observation_delta_indices(self) -> list:
